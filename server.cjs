@@ -1,4 +1,4 @@
-// server.cjs — Socket.IO + Target + Walmart monitors with first-party filter (Render-friendly)
+// server.cjs — Target + Walmart monitors with auto-slowdown (Render-friendly)
 
 const express = require("express");
 const { createServer } = require("http");
@@ -21,21 +21,13 @@ io.on("connection", (socket) => {
 const PORT = process.env.PORT || 8080;
 httpServer.listen(PORT, () => console.log(`Listening on port ${PORT}`));
 
-// ===== Config: add/remove products here =====
-/**
- * site: "target" | "walmart"
- * name: any label you like (shows in logs/payloads)
- * url: product page
- */
+// ===== Config =====
 const PRODUCTS = [
-  // --- Target (your Pokémon collection) ---
   {
     site: "target",
     name: "Pokémon Prismatic Evolutions Premium Figure Collection",
     url: "https://www.target.com/p/pok-233-mon-trading-card-game-scarlet-38-violet-prismatic-evolutions-premium-figure-collection/-/A-94864079",
   },
-
-  // --- Walmart (updated names) ---
   {
     site: "walmart",
     name: "Pokémon Prismatic Booster Bundle",
@@ -48,20 +40,39 @@ const PRODUCTS = [
   },
 ];
 
-// ===== Tuning (env vars optional on Render) =====
-const FAST_INTERVAL_MS = Number(process.env.FAST_INTERVAL_MS || 3000); // how often to re-check list
-const STAGGER_MS = Number(process.env.STAGGER_MS || 600);              // spacing between items per cycle
+// ===== Tuning =====
+const BASE_FAST = Number(process.env.FAST_INTERVAL_MS || 3000);
+const BASE_SLOW = Number(process.env.SLOW_INTERVAL_MS || 10000);
+const STAGGER_MS = Number(process.env.STAGGER_MS || 600);
 const UA =
   process.env.USER_AGENT ||
   "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari";
+const WALMART_REQUIRE_FIRST_PARTY = true;
 
-// Walmart-only-first-party toggle
-const WALMART_REQUIRE_FIRST_PARTY = true; // only alert when sold & shipped by Walmart (first-party)
+// ===== Auto-slowdown state =====
+let currentInterval = BASE_FAST;
+let consecutiveErrors = 0;
+let cycleTimer = null;
 
-// Remember last status so we only emit on change
-const lastStatus = new Map(); // url -> "in_stock" | "oos" | "preorder" | "third_party"
+function adjustInterval(ok) {
+  if (ok) {
+    if (consecutiveErrors > 0) consecutiveErrors = 0;
+    if (currentInterval > BASE_FAST) {
+      currentInterval = Math.max(BASE_FAST, currentInterval - 1000);
+      console.log(`✅ Healthy again. Speeding up to ${currentInterval}ms`);
+    }
+  } else {
+    consecutiveErrors++;
+    if (consecutiveErrors >= 3 && currentInterval < BASE_SLOW) {
+      currentInterval = Math.min(BASE_SLOW, currentInterval + 2000);
+      console.log(`⚠️ Multiple errors. Slowing down to ${currentInterval}ms`);
+      consecutiveErrors = 0; // reset counter after backoff
+    }
+  }
+  restartScheduler();
+}
 
-// ===== Helpers =====
+// ===== Fetch helper =====
 async function fetchHTML(url) {
   try {
     const res = await axios.get(url, {
@@ -75,9 +86,11 @@ async function fetchHTML(url) {
       validateStatus: (s) => s >= 200 && s < 400,
       maxRedirects: 5,
     });
+    adjustInterval(true); // success
     return typeof res.data === "string" ? res.data : "";
   } catch (e) {
     console.log("Fetch failed:", e.message, "->", url);
+    adjustInterval(false); // failure
     return "";
   }
 }
@@ -92,28 +105,14 @@ function detectTargetStatus(html) {
 
   const jsonOut =
     /"availabilityStatus"\s*:\s*"OUT_OF_STOCK"/i.test(html) ||
-    /"availability"\s*:\s*"(?:https?:\/\/schema\.org\/)?OutOfStock"/i.test(html) ||
-    /"is_out_of_stock_in_all_store_locations"\s*:\s*true/i.test(html);
+    /"availability"\s*:\s*"(?:https?:\/\/schema\.org\/)?OutOfStock"/i.test(html);
 
-  const jsonPre =
-    /"availabilityStatus"\s*:\s*"PREORDER"/i.test(html) ||
-    /\bpreorder\b/i.test(html);
+  const jsonPre = /"availabilityStatus"\s*:\s*"PREORDER"/i.test(html);
 
   if (jsonOut && !jsonInStock) return "oos";
   if (jsonPre && !jsonInStock) return "preorder";
   if (jsonInStock && !jsonOut) return "in_stock";
 
-  const $ = cheerio.load(html);
-  let hasEnabledPurchaseCta = false;
-  $("button,a.button").each((_, el) => {
-    const text = ($(el).text() || "").toLowerCase();
-    const disabled =
-      $(el).attr("disabled") != null || $(el).attr("aria-disabled") === "true";
-    if (!disabled && /add to cart|ship it|pick up|buy now/.test(text)) {
-      hasEnabledPurchaseCta = true;
-    }
-  });
-  if (hasEnabledPurchaseCta && !jsonOut) return "in_stock";
   return "oos";
 }
 
@@ -142,26 +141,25 @@ function detectWalmartStatus(html) {
   return { status: "oos", isFirstParty };
 }
 
-// ===== Per-site checkers =====
+// ===== Checkers =====
 async function checkTarget(p) {
   const html = await fetchHTML(p.url);
   if (!html) return;
-  const status = detectTargetStatus(html);
-  handleStatusUpdate(p, status);
+  handleStatusUpdate(p, detectTargetStatus(html));
 }
 
 async function checkWalmart(p) {
   const html = await fetchHTML(p.url);
   if (!html) return;
   const { status, isFirstParty } = detectWalmartStatus(html);
-
   const effectiveStatus =
     WALMART_REQUIRE_FIRST_PARTY && status === "third_party" ? "oos" : status;
-
   handleStatusUpdate(p, effectiveStatus, { isFirstParty, rawStatus: status });
 }
 
-// ===== Shared status handler =====
+// ===== Status update =====
+const lastStatus = new Map();
+
 function handleStatusUpdate(p, status, extra = {}) {
   const prev = lastStatus.get(p.url);
   if (prev === status) return;
@@ -173,7 +171,7 @@ function handleStatusUpdate(p, status, extra = {}) {
     site: p.site,
     name: p.name,
     url: p.url,
-    status, // "in_stock" | "oos" | "preorder" | "third_party"
+    status,
     ts: Date.now(),
     ...extra,
   };
@@ -185,15 +183,20 @@ function handleStatusUpdate(p, status, extra = {}) {
   );
 }
 
-// ===== Scheduler =====
+// ===== Scheduler with auto-slowdown =====
 function runCycle() {
   PRODUCTS.forEach((p, i) => {
     setTimeout(() => {
-      if (p.site === "target") return checkTarget(p);
-      if (p.site === "walmart") return checkWalmart(p);
+      if (p.site === "target") checkTarget(p);
+      if (p.site === "walmart") checkWalmart(p);
     }, i * STAGGER_MS);
   });
 }
 
+function restartScheduler() {
+  if (cycleTimer) clearInterval(cycleTimer);
+  cycleTimer = setInterval(runCycle, currentInterval);
+}
+
 runCycle();
-setInterval(runCycle, FAST_INTERVAL_MS);
+restartScheduler();
