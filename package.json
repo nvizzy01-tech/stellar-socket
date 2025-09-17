@@ -1,7 +1,6 @@
 {
   "name": "stellar-socket",
   "version": "1.0.0",
-  "type": "module",
   "engines": { "node": ">=18" },
   "dependencies": {
     "express": "^4.19.2",
@@ -10,6 +9,6 @@
     "cheerio": "^1.0.0-rc.12"
   },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.cjs"
   }
 }
