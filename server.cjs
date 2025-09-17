@@ -1,4 +1,4 @@
-// server.cjs (CommonJS, deploy-safe on Render)
+// server.cjs
 
 const express = require("express");
 const { createServer } = require("http");
@@ -21,8 +21,8 @@ io.on("connection", (socket) => {
 // --- Target product monitor ---
 const TARGET_PRODUCT = {
   site: "target",
-  name: "2025 Panini NFL Score Blaster Box",
-  url: "https://www.target.com/p/2025-panini-nfl-score-football-trading-card-blaster-box/-/A-94681674"
+  name: "Pokémon Prismatic Evolutions Premium Figure Collection",
+  url: "https://www.target.com/p/pok-233-mon-trading-card-game-scarlet-38-violet-prismatic-evolutions-premium-figure-collection/-/A-94864079"
 };
 
 let lastStatus = "unknown";
@@ -77,7 +77,7 @@ async function checkTargetOnce() {
 setInterval(checkTargetOnce, 3000);
 checkTargetOnce();
 
-// --- Start server (Render supplies PORT) ---
+// --- Start server ---
 const PORT = process.env.PORT || 8080;
 httpServer.listen(PORT, () => {
   console.log(`Listening on port ${PORT}`);
